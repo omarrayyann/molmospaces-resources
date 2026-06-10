@@ -544,14 +544,26 @@ class ResourceManager:
                 if beh.link_strategy is LinkStrategy.GLOBAL or skip_linking:
                     continue
 
-                for pkg in tqdm(
-                    packages,
-                    desc=f"Linking {data_type}/{source}",
-                    disable=len(packages) < TQDM_DISABLE_THRES,
-                ):
-                    trie = self.tries(data_type, source).get(pkg)
-                    if trie is not None:
-                        self._ensure_package_linked(inst, pkg, trie, rel)
+                # Parallelize across threads: per-package symlink/mkdir/stat
+                # are NFS-latency-bound and release the GIL, so threads scale.
+                from concurrent.futures import ThreadPoolExecutor as _TPE
+
+                trie_map = self.tries(data_type, source)
+                pkgs_to_link = [p for p in packages if trie_map.get(p) is not None]
+                link_workers = max(1, int(os.environ.get("MLSPACES_LINK_WORKERS", "32")))
+
+                def _link_one(pkg: str) -> None:
+                    self._ensure_package_linked(inst, pkg, trie_map[pkg], rel)
+
+                with _TPE(max_workers=link_workers) as _lp:
+                    list(
+                        tqdm(
+                            _lp.map(_link_one, pkgs_to_link),
+                            total=len(pkgs_to_link),
+                            desc=f"Linking {data_type}/{source}",
+                            disable=len(pkgs_to_link) < TQDM_DISABLE_THRES,
+                        )
+                    )
 
     def install_all_for_source(
         self, data_type: str, source: str, **kwargs: Any
@@ -688,16 +700,21 @@ class ResourceManager:
         if _complete_link_flag(package, link_dir).exists():
             return
 
-        # Create directories first
+        # Create directories first. link_dir is absolute, so skip .resolve()
+        # (resolving stats every path component -- expensive over NFS).
         for dir_path in CompactPathTrie.from_paths(trie.non_leaf_paths()).leaf_paths():
-            (link_dir / dir_path).resolve().mkdir(parents=True, exist_ok=True)
+            (link_dir / dir_path).mkdir(parents=True, exist_ok=True)
 
-        # Symlink each leaf file
+        # Symlink each leaf file. Avoid .resolve()/.exists() on the NFS source
+        # path; os.symlink doesn't need a resolved target. Just attempt the
+        # link and swallow "already exists" -- the only NFS-free fast path.
         for leaf in trie.leaf_paths():
-            dst = (link_dir / leaf).resolve()
-            if not dst.exists():
-                src = (self.cache_dir / relative_path / leaf).resolve()
+            dst = link_dir / leaf
+            src = self.cache_dir / relative_path / leaf
+            try:
                 os.symlink(src, dst, target_is_directory=False)
+            except FileExistsError:
+                pass
 
         _complete_link_flag(package, link_dir).touch(exist_ok=False)
 
